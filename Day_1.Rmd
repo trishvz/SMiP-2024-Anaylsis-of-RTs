@@ -1,0 +1,1128 @@
+---
+title: "Day 1 - Fitting Models of Response Time"
+author: "TVZ"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 3
+  pdf_document:
+    toc: true
+    toc_depth: 3 
+editor_options: 
+  markdown: 
+    wrap: 80
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Here are some of the libraries that we're going to need.
+
+```{r}
+# install.packages("rtdists")"
+# install.packages("remotes")
+library("rtdists")
+library("extraDistr")
+library("muhaz")
+library("moments")
+library('gamlss')
+library('PWEXP')
+```
+
+Load the Wagenmakers dataset
+
+```{r}
+load("wagenmakers.Rdata")
+```
+
+Here are some functions for the kernel estimators of the pdf, cdf and
+hazard functions.
+
+```{r}
+# Silverman's plugin bandwidth for kernel estimators
+silverman <- function(data) {
+    A <- min(c(sd(data),IQR(data)/1.34))
+    N <- length(data)
+    return((4/3)^.2 * A * N^(-.2))
+    }
+
+# A Gaussian kernel density estimate    
+# Compare with R's density(data)
+kernel.density <- function(data,points=data) {
+    N <- length(data)
+    points <- unique(sort(points))
+    # Silverman's bandwidth is the standard deviation of the normal kernel
+    h <- silverman(data)
+    f <- vector()
+    for (i in 1:length(points)) {
+    	# Every observation is weighted by its distance from the point
+        z <- (points[i]-data)/h
+        kernel <- dnorm(z)
+        # ... and then averaged
+        f[i] <- mean(kernel)/h
+    }
+    return(cbind(points=points,f=f))
+    }
+
+# Gaussian kernel estimate of the CDF
+cdf <- function(data,points=data) {
+    N <- length(data)
+    points <- unique(sort(points))
+    h <- silverman(data)
+    ps <- vector()
+    for (i in 1:length(points)) {
+       z <- (points[i]-data)/h
+       # Average the points weighted by the integrated kernel
+       kernel <- pnorm(z)
+       ps[i] <- mean(kernel)
+       }
+    return(cbind(points=points,ps=ps))
+}
+
+# Gaussian kernel estimate of the hazard function
+hazard <- function(data,points=data) {
+    N <- length(data)
+    points <- unique(sort(points))
+    # Compute the appropriate ratio of the kernel estimates of the
+    # density and survivor functions
+    f <- kernel.density(data,points)
+    F <- cdf(data,points)
+    h <- f[,2]/(1 - F[,2])
+    return(cbind(points=points,h=h))
+    }
+```
+
+# Analysis of Response Times
+
+What is involved in analyzing response times (RTs)? Let's first break
+down the kind of experiment that produces RT data.
+
+The experiment will ask some number $N$ of participants to make $n$
+responses to some kind of task (usually a choice task). There may be $J$
+conditions in the task (e.g., easy vs. hard), and these conditions may
+be either repeated within participants or be between participants.
+
+For each participant by condition "cell" in the design, we can compute a
+mean RT for each participant, then compute a condition mean by averaging
+the participant means. (Note that this strategy opens the door to
+Simpson's Paradox: a pattern may hold in the condition means that does
+not hold for the participant means.)
+
+Analyzing RT data by way of means, means that are then subjected to
+t-tests or ANOVA, obscures much information about the data, information
+that can help us uncover the kinds of processes that generated the
+response. For this reason we usually analyze RT data at a *distribution*
+level.
+
+As we go through these kinds of analyses, keep in mind the simplifying
+assumptions that you have to make. Some of these include
+
+1.  Individual participants engage exactly the same cognitive process to
+    perform the task. There are no variations in strategy across
+    participants.
+2.  Individual participants also use exactly the same process parameters
+    (bias, information accumulation rate, etc.).
+3.  The RTs collected over trials are independent. A slow RT on trial 6
+    does not influence the RT on trial 7.
+4.  The RTs collected over trials are identically distributed. The
+    distribution that describes how RTs are distributed at the end of
+    the experiment is the same as the distribution that describes the
+    RTs at the beginning.
+5.  Related to 4., there is no variation in the process used to perform
+    the task during an individual's participation.
+6.  Related to 4., process parameters are constant and do not vary over
+    time, they only vary because of changing task demands.
+
+Sometimes we make these assumptions for the sake of simplicity. Rarely
+do we because we believe them to be true.
+
+# Probability
+
+RTs are random variables. Random variables are described by their
+distributions. R uses 4 functions (a "quad") to define a distribution.
+The name of the distribution has a "root" (e.g., "norm" for the normal
+distribution) and then
+
+1.  dnorm: the normal density function
+2.  pnorm: the cumulative normal distribution function
+3.  qnorm: the normal quantile function (the inverse of pnorm)
+4.  rnorm: the normal random number generator
+
+The rtdists package contains the quads for the Ratcliff drift diffusion
+model (ddm) and several versions of the Brown & Heathcote linear
+ballistic accumulator (lba).
+
+```{r Gamma Simulation}
+# Simulate observations from a gamma distribution and compute their mean and variance
+bignum <- 10000 # Sample size is really really big
+k <- 4
+alpha <- .5
+X <- rgamma(bignum,shape=k,scale=alpha)
+```
+
+# Functions that Define a Distribution
+
+Most random variables have a closed-form distribution function $F(x)$,
+which gives the probability of observing any value less than or equal to
+$x$, $Pr(X \le x)$.
+
+If $F(x)$ is differentiable then $\dfrac{d}{dx} F(x) = f(x)$, the
+density function. Not all distribution functions are differentiable,
+hence not every random variable has a density function.
+
+The survivor function $\overline{F}(x) = 1 - F(x)$ gives the probability
+that the variable takes on a value that is at least $x$, or that the
+process "lives" past $x$. The hazard function
+$h(x) = f(x)/\overline{F}(x)$ is the conditional density of $X$ given
+that the process has survived to "time" $x$.
+
+In addition to these, there are also the moment generating function and
+the characteristic function. These different functions uniquely
+characterize a distribution so the one you choose to work with should be
+the one that gives you the information that you need.
+
+We often focus on the density function in RT analyses, because its shape
+is informative and also because the density is the basis for model
+fitting techniques such as likelihood maximization and for Bayesian
+inference.
+
+## 1. Your turn!
+
+The extraDistr and rtdists packages have some of the distributions
+commonly associated with RT distributions.\
+Simulate an RT dataset using your favorite model. Choose appropriate
+parameter values and save the dataset for later work.
+
+Think about the parameters of your model. What values are they permitted
+to take on (positive, less than one, etc.)? Imagine searching for those
+parameters in a multidimensional space. Will you need to constrain those
+parameters so they stay in the right parts of the space.
+
+```{r}
+# Put your code here
+```
+
+# Estimating Functions
+
+There are several ways to estimate density, distribution, hazard, and
+etc. functions. Densities are usually estimated with histograms or
+kernel estimates. Distributions are estimated from the cumulative
+relative frequency distribution or by integrating the kernel density
+estimate. The hazard function is difficult to estimate because the
+denominator goes to 0 in the tail of the distribution, resulting in very
+unstable values.
+
+R has a number of functions that permit estimation of a random
+variable's distribution.
+
+|      R Function      |              |          |
+|:--------------------:|:------------:|:--------:|
+| hist(...,freq=FALSE) |   density    |  $f(y)$  |
+|     density(...)     |   density    |  $f(y)$  |
+|      ecdf(...)       | distribution |  $F(y)$  |
+|      pehaz(...)      |    hazard    |  $h(y)$  |
+|    pwexp.fit(...)    |    hazard    | $h(y)$ ] |
+
+The following code chunk illustrates how the different functions reveal
+different information about the variable.
+
+```{r}
+# Define plot points
+x <- seq(0,max(X),length=200)
+
+par(mfrow=c(1,3))
+plot(x,dwald(x,2,8),type='l',main="Density Functions",xlab="Values of X",
+     ylab="")
+lines(x,dgamma(x,shape=k,scale=alpha),col="purple4")
+legend("topright",c("Wald","Gamma"),lty=1,col=c("black","purple4"))
+
+plot(x,pwald(x,2,8),type='l',main="Distribution Functions",xlab="Values of X",
+     ylab="")
+lines(x,pgamma(x,shape=k,scale=alpha),col="purple4")
+
+plot(x,dwald(x,2,8)/(1-pwald(x,2,8)),type='l',main="Hazard Functions",ylim=c(0,2),xlab="Values of X",
+     ylab="")
+lines(x,dgamma(x,shape=k,scale=alpha)/(1-pgamma(x,shape=k,scale=alpha)),col="purple4")
+```
+
+The next chunks of code use different estimators for the pdf, cdf, and
+hazard functions.
+
+```{r}
+# The simulated data X is of size bignum.  Play with this number.  What happens when it's small vs. big?
+# Histogram and kernel estimates of f(x)
+par(mfrow=c(2,1))
+hist(X,freq=FALSE,breaks=50,main="Histogram Estimate",xlab="Values of X")
+lines(x,dgamma(x,shape=k,scale=alpha),col="purple4")
+
+plot(density(X),main="Kernel Density Estimate",xlab="Values of X")
+lines(x,dgamma(x,k,scale=alpha),col="purple4")
+par(mfrow=c(1,1)) # reset to single plots
+```
+
+The cdf is easier to estimate. R has an ecdf() function (empirical
+cumulative distribution function), which computes the *naive* estimator,
+which is just the cumulative relative frequency.
+
+```{r}
+plot(ecdf(X),main="Estimate of F(x)",xlab="Values of X",ylab="F(x)",col="purple4")
+lines(x,pgamma(x,k,1/alpha))
+```
+
+For hazard functions, there are a handful of methods that have been
+proposed. I prefer the kernel and piecewise exponential methods. The
+kernel method is in the cdf() function provided above.
+
+```{r}
+# Compute the "true" hazard function
+true.h <- dgamma(x,shape=k,scale=alpha)/(1-pgamma(x,shape=k,scale=alpha))
+
+# Kernel estimate
+# These will be very slow for large values of bignum
+kernel.h <- hazard(X)
+
+# Piecewise exponential estimate
+pe.h <- pehaz(X)
+```
+
+I separated out the estimation from the plot procedures because the
+estimations take some time. Reduce the value of bignum in [Probability]
+if you want to speed it up.
+
+```{r}
+# Create two plots of the two hazard estimates with the "true" gamma hazard
+par(mfrow=c(2,1))
+plot(kernel.h[,1],kernel.h[,2],xlim=c(0,8),ylim=c(0,4),type='l',
+     main="Kernel Estimate of the Hazard Function",
+     xlab="Values of X",ylab="Hazard")
+lines(x,true.h,col="purple4")
+plot(pe.h$Cuts[-1],pe.h$Hazard,xlim=c(0,8),ylim=c(0,4),type='l',
+     main="Piecewise Exponential Estimate of the Hazard Function",
+     xlab="Values of X",ylab="Hazard")
+lines(x,true.h,col="purple4")
+```
+
+## Wagenmakers Data
+
+Estimate the pdf, cdf, and hazard functions for a subset of the
+Wagenmakers dataset.
+
+```{r}
+# Subset the data
+Y <- subset(wagenmakers,subject==1 & task == 3 & long==1)
+
+# Compute the estimates
+density.y <- density(Y$RT)  # kernel estimate
+cdf.y <- ecdf(Y$RT) # naive estimator
+hazard.y <- pehaz(Y$RT) # piecewise exponential
+
+# Plot the estimates
+par(mfrow=c(1,3))
+plot(density.y,type='l',main="Density Function",xlab="Values of X",
+     ylab="")
+plot(cdf.y,,main="Distribution Function",xlab="Values of X",
+     ylab="")
+plot(hazard.y$Cuts[-1],hazard.y$Hazard,type='l',main="Hazard Functions",xlab="Values of X",
+     ylab="")
+```
+
+## 2. Your turn!
+
+Estimate the pdf, cdf and hazard functions of the data you simulated.
+Add the "true" function on top of the estimates. Then estimate the pdf,
+cdf, and hazard functions of your own data.
+
+```{r}
+# Insert your code here
+```
+
+# Likelihood
+
+A likelihood function is a way to measure how well a statistical model
+explains the data we have. For a specified distribution (e.g., the
+gamma) we compute the joint probability of the data for different values
+of the distribution parameters. It is important to remember that the
+likelihood function is conditioned on the data and is a function of the
+parameter values.
+
+The likelihood $\mathcal{L}$ for a dataset $Y = \{Y_1, \ldots, Y_N\}$
+for a model $f_Y(y|\theta)$ is the product of the values of the density
+function for each of the values of $Y$: $$
+\mathcal{L}(\theta|Y) = \prod_{i=1}^N f_Y(Y_i|\theta).
+$$
+
+Because this product can be difficult to work with we often transform
+the likelihood to the log likelihood: $$
+\ln \mathcal{L}(\theta|Y) = \sum_{i=1}^N \ln f_Y(Y_i|\theta).
+$$
+
+R makes it easy to compute the log likelihood function by way of the
+"log=TRUE" option that can be passed to the density function for each
+quad.
+
+```{r}
+# Compute the likelihood of the simulated data X
+log.like <- sum(dgamma(X,shape=k,scale=alpha,log=TRUE))
+like <- exp(log.like)
+
+# Plot the likelihood values for different values of alpha
+alpha.range <- seq(.2,2,length=200)
+
+log.like <- vector()
+for (i in 1:length(alpha.range)) {
+  log.like[i] <- sum(dgamma(X[1:500],shape=k,scale=alpha.range[i],log=TRUE))
+}
+plot(alpha.range,log.like,type='l',xlab="Values of Alpha",ylab="Log Likelihood")
+```
+
+# Fitting a Model
+
+A model-fitting exercise is simply the estimation of model parameters
+given the data observed. There are many ways this can be done.
+
+In the code below we will explore
+
+1.  Method of moments
+2.  Least squares
+3.  Likelihood maximization
+4.  Bayesian estimation
+
+## Method of Moments
+
+Perhaps the easiest way to fit a model to data is to use the method of
+moments.
+
+A distributional moment is a function of the powers of the variable. The
+$n^{th}$ *raw* moment of a variable $X$ is the expected value
+(population mean) of the variable $X^n$. The $n^{th}$ *central* moment
+of a variable is the expected value of $[X - E(X)]^n$. So, the
+distribution mean $\mu$ is the first raw moment of a distribution and
+the variance $\sigma^2$ is the second central moment. Skewness $\kappa_3$ is
+related to the 3rd moment and kurtosis to the 4th.
+
+The mean and variance (and skewness and kurtosis and etc.) of a
+distribution are a function of that distribution's parameters. For
+example, consider the gamma distribution, which has a shape parameter
+$k$ and a scale parameter $\alpha$. The mean of the distribution is
+$k \alpha$ and the variance is $k \alpha^2$. So if
+
+```{=tex}
+\begin{eqnarray*}
+E(X) & = & k \alpha \text{ and}\\
+Var(X) & = & k \alpha^2
+\end{eqnarray*}
+```
+then
+
+```{=tex}
+\begin{eqnarray*}
+k & = & E(X)^2/Var(X) \text{ and}\\
+\alpha & = & Var(X)/E(X).
+\end{eqnarray*}
+```
+This suggests that good guesses for $k$ and $\alpha$ might be
+
+```{=tex}
+\begin{eqnarray*}
+\hat{k} & = & \overline{X}^2/s^2 \text{ and}\\
+\hat{\alpha} & = & s^2/\overline{X}.
+\end{eqnarray*}
+```
+Let's try this for the subset of the Wagenmakers data.
+
+```{r}
+mean.Y <- mean(Y$RT)
+var.Y <- var(Y$RT)
+
+k.hat <- mean.Y^2/var.Y
+alpha.hat <- var.Y/mean.Y
+
+# Examine the fit
+y.values <- seq(0,max(Y$RT),length=400)
+hist(Y$RT,freq=FALSE,breaks=50,main="Estimate of RT Density")
+lines(y.values,dgamma(y.values,k.hat,scale=alpha.hat))
+```
+
+The estimate of k is very large (`r k.hat`). As the gamma shape
+parameter grows, the gamma distribution tends to the normal. The reason
+k.hat is large is because RT distributions have a delay -- we don't
+start seeing responses until around 200 ms after the stimulus
+presentation. The fit might be improved by adding a shift, so that
+$RT = Y + c$, where $Y$ is distributed as a gamma.
+
+The method of moments requires that we add a third moment to estimate
+$c$. Skewness, the third central moment of the gamma distribution is
+$\kappa_3 = 2/\sqrt{k}$. This implies that
+
+```{=tex}
+\begin{eqnarray*}
+\hat{k} & = & 4/\kappa_3^2, \\
+\hat{\alpha} & = & s \kappa_3 / 2 \text{ and} \\
+\hat{c} & = & \overline{Y} - s/\kappa_3.
+\end{eqnarray*}
+```
+```{r}
+k.hat <- 2/skewness(Y$RT)
+alpha.hat <- sd(Y$RT)*skewness(Y$RT)/2
+c.hat <- mean(Y$RT) - sd(Y$RT)/skewness(Y$RT)
+
+hist(Y$RT,freq=FALSE,breaks=50,main="",xlab="Values of RT",ylim=c(0,.0361))
+lines(y.values,dgamma(y.values-c.hat,k.hat,scale=alpha.hat))
+```
+
+As you can see, shifting the distribution and using method of moments
+didn't work very well.
+
+### 3. Your turn
+
+Estimate the parameters of your data set using method of moments. Select
+a model distribution for which the mean, variance, and potentially
+higher moments are well defined. As I did above, evaluate the fit of
+your model by plotting the density estimate (histogram or kernel
+density) against the model density using the estimated parameter values.
+Then, add a shift parameter $c$ (so $RT = Y + c$), recalculate the
+method of moments estimators, and again evaluate the fit.
+
+Some things to consider:
+
+1.  Do the estimated parameter values make sense?
+2.  Is the fit (match) acceptable?
+3.  Are the parameter constraints (e.g., positive, less than one, etc.)
+    guaranteed to be preserved with this method?
+
+```{r}
+# Insert your code here
+```
+
+## Nonlinear Least Squares
+
+Fitting a model to data is often cast as an optimization problem, in
+which the goal is to optimize (maximize reward or minimize penalty) some
+*objective function* by systematically varying parameter values. For
+methods of least squares, the objective function is the sum of squared
+differences between observed and predicted values. In some cases (linear
+regression) we can solve for the optimal parameter values exactly. In
+other cases we need to perform a search of the parameter space to try
+and find those optimal values.
+
+### The optim() function
+
+The optim() function takes as arguments par (a vector of parameter
+starting values), fn (the objective function), gr (the gradient, which
+we won't discuss), method (the search algorithm), lower and upper (the
+allowable range of the parameters), control (a list of control
+parameters for the search algorithm), and hessian (a logical variable
+that indicates whether a Hessian matrix should be returned, another
+thing we won't discuss). The function returns, among other things, par
+(the set of parameters that optimizes the objective function), value
+(the maximized or minimized value of the objective function), and
+convergence (a code that indicates whether the search was successful).
+
+The optim function implements a number of different search algorithms.
+The default search algorithm is the Nelder-Mead (1965) simplex
+algorithm. A simplex is a geometric object (polytope) with $N+1$
+vertices that wiggles around in $N$-dimensional space, where $N$ is the
+number of parameters you are trying to find. This is a simple and
+reliable (if slow) algorithm for well-behaved objective functions.
+
+```{r}
+# Define an objective function
+ss <- function(c,x) sum((x-c)^2)
+
+# Generate some data
+fake.data <- rnorm(100,100,15)
+
+# What value of central tendency minimizes the variance?
+mu.hat <- 10 # Initial guess for c
+
+fit <- optim(par=mu.hat,ss,x=fake.data)
+```
+
+The least-squares estimate of $c$ is `r fit$par`, which is close to the
+value $c=100$ that generated the data. The minimized value of the ss
+function is `r round(fit$value,2)`. The convergence code is `r fit$convergence`,
+indicating that the search algorithm successfully found a minimum (0) or failed to converge (1).
+
+You may remember that the sample mean $\overline{X}$ is the measure of
+central tendency $C$ that minimizes the sum of squared deviations
+$\sum_{i=1}^N (X_i - C)^2$. It might be interesting to you to compare
+the optimized value of ss() to the numerator of the sample variance
+$s^2$, and to compare the least-squares estimate of $c$ to the sample
+mean $\overline{X}$.
+
+```{r}
+cat("The sample mean is ",mean(fake.data),"and the estimated mean is ",fit$par,".\n")
+cat("The sample sum of squares is ",(length(fake.data)-1)*var(fake.data),"and the optimized ss is ",fit$value,".")
+```
+
+One thing to note is that optim() minimizes functions by default (but
+this can be changed with the control argument). If your optimization
+requires maximization instead (such as maximum likelihood, see below),
+then make sure you define your objective function such that minimizing
+it actually maximizes what you want. That is, multiply your objective
+function by -1.
+
+### The objective function
+
+For nonlinear least squares we need to figure out what aspect of the RT
+distribution should enter into the objective function. A reasonable
+choice is to try to match the empirical cdf to the theoretical cdf. Here
+is a function that computes the sum of squared deviations between an
+empirical cdf and the gamma cdf. A non-decisional (shift) term is
+included.
+
+```{r}
+# The array est.cdf contains the RT values in the 1st column and the cdf in the 2nd column.
+# The pars vector contains the starting values for the gamma distribution on an infinite scale.
+ss.gamma <- function(pars,est.cdf) {
+   # Note reparameterization!  Exponentiating the parameter values insures that they are all positive.
+   k <- exp(pars[1])
+   alpha <- exp(pars[2])
+   c <- exp(pars[3])
+
+   F.hat <- est.cdf[,2]
+   points <- est.cdf[,1]
+
+   # If you modify this function to fit a different distribution make sure you also change the parameters in
+   # all necessary ways.
+   ss <- sum((F.hat - pgamma(points-c,k,scale=alpha))^2) 
+   return(ss)
+   }
+```
+
+In the following chunk of code, we will fit a gamma distribution to the
+subsetted Wagenmakers data using least squares. We will first compute
+the empirical cdf with the quantile() function.
+
+```{r}
+p <- seq(.01,.99,by=.01)
+times <- quantile(Y$RT,p)
+est.cdf <- cbind(times,p)
+```
+
+Now we will pass the estimated cdf to the ss.gamma() function through
+the optimization function optim(). We'll use the method of moments
+estimates of the gamma parameters as a starting point. Because the
+ss.gamma() function exponentiates the parameter values we will need to
+start with the logged method of moments estimates.
+
+```{r}
+# Use the method of moment estimates as starting values
+start.pars <- log(c(k.hat,alpha.hat,c.hat)) # We'll exponentiate these inside ss.gamma
+fit.gamma <- optim(start.pars,ss.gamma,est.cdf=est.cdf)
+```
+
+The next step is an initial evaluation of the fit of the model by
+plotting the observed distribution against the best-fitting gamma
+distribution. We can look at both the density and the cdf.
+
+```{r}
+# Exponentiate the recovered parameters and assign them to k, alpha, and c
+ss.pars <- exp(fit.gamma$par)
+k.hat <- ss.pars[1]
+alpha.hat <- ss.pars[2]
+c.hat <- ss.pars[3]
+
+# Plot the observed and theoretical density and distribution functions
+par(mfrow=c(1,2))
+hist(Y$RT,freq=FALSE,breaks=50,main="",xlab="Values of RT",
+     xlim=c(0,600),ylim=c(0,.01))
+lines(y.values,dgamma(y.values-c.hat,k.hat,scale=alpha.hat))
+
+plot(times,p,xlab="Values of RT",ylab="F(X)",type='p')
+lines(times,pgamma(times-c.hat,k.hat,scale=alpha.hat),col="blue")
+
+```
+
+Another way to evaluate the goodness of fit visually is the QQ plot,
+which simply plots the observed quantiles as a function of the
+theoretical quantiles. A good fit is exhibited by all the points lying
+on the identity line $y=x$.
+
+```{r}
+plot(pgamma(times-c.hat,k.hat,scale=alpha.hat),p,type='p',
+     xlab="Gamma Quantiles",ylab="Observed Quantiles")
+abline(0,1)
+```
+
+This a a remarkably good fit.
+
+### 4. Your turn!
+
+Fit a gamma or other model to your own data using least squares. If you
+are using the Wagenmakers dataset try to fit a Wald (pwald, for the cdf)
+or ex-Gaussian model.
+
+## Maximum Likelihood
+
+The difference between least squares minimization and likelihood
+maximization is in the objective function to be used. You computed a
+likelihood earlier, and recall that the likelihood is based on the joint
+probability of the data (as given by a model), but is a function of the
+parameter values and not the data.
+
+Let's first define an appropriate likelihood function for the gamma
+model we've been using, and then pass it through R's optim() function.
+Before we do this, note two things.
+
+1.  The log of a variable is a monotonic function of that variable. That
+    is, if the variable increases the log of it also increases.
+    Similarly, if the variable decreases the log of it also decreases.
+    This means that the parameters that maximize the likelihood function
+    will also maximize the log likelihood. Because it is much easier and
+    avoids numerical under- and overflows, we will work with the log
+    likelihood function.
+2.  Because we want to maximize the log likelihood function and
+    optim()'s default is to minimize, we are going to define the
+    *negative* log likelihood. Minimizing the negative log likelihood
+    maximizes the positive log likelihood.
+
+```{r}
+# Define the negative log likelihood function for the gamma model
+ll.gamma <- function(pars,X) {
+  # Reparameterize so that the model parameters are appropriately positive
+  k <- exp(pars[1])
+  alpha <- exp(pars[2])
+  c <- exp(pars[3])
+  
+  ll <- -sum(dgamma(X-c,k,scale=alpha,log=TRUE))
+  
+  # Uncomment these lines (see below) to eliminate the error and rerun this code chunk
+  #  lls <- dgamma(X-c,k,scale=alpha,log=TRUE)
+  #  lls[abs(lls)==Inf] <- -500
+  #  ll <- -sum(lls)
+  return(ll)
+}
+```
+
+Now as for the least squares estimation, pass the ll.gamma function
+through the optim() function.
+
+```{r}
+# Select starting values
+# start.pars <- log(c(k.hat,alpha.hat,c.hat)) # Method of moments estimates
+start.pars <-  fit.gamma$par # Least squares estimates
+fit.gamma.ll <- optim(start.pars,ll.gamma,X=Y$RT)
+```
+
+When you run this code chunk you might get an error like this:
+
+> Error in optim(start.pars, ll.gamma, X = Y\$RT) : function cannot be
+> evaluated at initial parameters
+
+Usually this means that the objective function is returning values like
+NaN (not a number) or Inf (infinity, positive or negative) for one,
+some, or most of the values in the dataset. You need to either try a
+different set of starting values or (and) "nudge" the algorithm in the
+right direction.
+
+If the log likelihood of a datapoint is negative infinity, the
+likelihood is zero. To avoid infinities, choose instead some very "big"
+negative number that, when exponentiated, would be pretty close to 0.
+Substitute this value into the likelihood computation directly. If you
+get this error, go back to the negative log likelihood function and
+uncomment the indicated lines of code.
+
+When you have eliminated the error, come back to this point and evaluate
+the fit.
+
+```{r}
+# Exponentiate the recovered parameters and assign them to k, alpha, and c
+ss.pars <- exp(fit.gamma.ll$par)
+k.hat <- ss.pars[1]
+alpha.hat <- ss.pars[2]
+c.hat <- ss.pars[3]
+
+# Plot the observed and theoretical density and distribution functions
+par(mfrow=c(1,2))
+hist(Y$RT,freq=FALSE,breaks=50,main="",xlab="Values of RT",
+     xlim=c(0,600),ylim=c(0,.01))
+lines(y.values,dgamma(y.values-c.hat,k.hat,scale=alpha.hat))
+
+plot(times,p,xlab="Values of RT",ylab="F(X)",type='p')
+lines(times,pgamma(times-c.hat,k.hat,scale=alpha.hat),col="blue")
+```
+
+You can see that the least squares method resulted in a much better fit
+than the likelihood maximization method. Likelihood maximization doesn't
+usually fail in this way.
+
+### 5. Your turn!
+
+Why do you think the likelihood maximization resulted in poorer fits
+than the least squares minimization? (Hint: Go back to those data points
+that gave -Inf for the log likelihood. What is it about those points
+that made this happen? How was this prevented in the least squares
+procedure?)
+
+How might you modify the model given your understanding of what is
+happening?
+
+### 6. Your turn!
+
+Fit the Wald (dwald(X,mu,lambda)) or exGaussian
+(dexGAUS(X,mu,sigma,tau)) model to your own data. Change the model in
+the objective function(s) appropriately, and don't forget to adjust the
+parameter values appropriately.
+
+```{r}
+# Insert your code here
+```
+
+## 7. Your turn!
+
+We only fit a single condition from a single participant from the
+Wagenmakers dataset. Now consider fitting two conditions. You will
+probably want to use two sets of parameter values, or some parameters
+will vary with condition while others will remain constant.
+
+Here is where your psychological interpretation of the parameters is
+going to be important. For example, if we model RTs with a gamma
+distribution, because of the link between the gamma distribution and
+Poisson information accumulator models, the shape parameter represents
+an information threshold and the inverse of the scale parameter is the
+rate at which information comes into the system.
+
+For the Wagenmakers data, consider the simple response task (Task 1).
+There are some theories (e.g., Laming, 1966) suggesting that information
+accumulation occurs even in the absence of a stimulus. The longer the
+RSI, the more random noise might be accumulated, resulting in an
+increase in the amount of information in the system at the time of
+stimulus presentation. So, you might guess that the RSI manipulation
+would influence the threshold (k) or the shift (c).
+
+```{r}
+# Compute the condition means and display those for Task 1
+w.means<-aggregate(wagenmakers$RT,by=list(wagenmakers$subject,wagenmakers$task,wagenmakers$long),mean)
+w.means[w.means$Group.2==1,]
+```
+
+How might you parameterize the gamma model so that you can fit two
+conditions at the same time? Here is one suggestion: the long variable
+takes values 1 (for short) and 2 (for long). You could write the
+parameter $k$ as $$
+k= k_0 + (long-1)*dk
+$$ for two parameters $k_0$ and $dk$, where $dk$ is the "effect" of
+increasing the RSI.
+
+Modify the least-squares or likelihood objective function to fit the two
+RSI conditions at the same time for a single participant in a single
+task. Fit the new model and evaluate the fit to the data using
+visualizations of the density or cdf.
+
+```{r}
+# Insert your code here
+```
+
+# Model Comparison
+
+The gamma model with a shift has three parameters. The diffusion model
+has as many as 9. We might expect, therefore, that the diffusion model
+fits better than the gamma model purely on the basis of its larger
+number of parameters. How do we determine if the added parameters are
+necessary?
+
+We're going to use the mystery dataset for this part.
+
+```{r}
+load("mystery.Rdata")
+
+library(ggplot2)
+
+# Mystery data has two stimulus conditions.  For now, just look at one of them
+# (stim = 0).
+# Combine the correct and incorrect RTs into a data frame, with an additional group identifier
+data <- data.frame(
+  value = c(rt[re==0 & stim==0], rt[re==1 & stim==0]),
+  group = factor(c(rep("Incorrect", length(rt[re==0])), rep("Correct", length(rt[re==1]))))
+)
+
+# Plot the histograms
+ggplot(data, aes(x = value, fill = group)) +
+  geom_histogram(alpha = 0.5, position = "identity", bins = 30) +  # Use 'position = identity' to overlay
+  scale_fill_manual(values = c("purple4", "orange3")) +                   # Custom colors for distinction
+  labs(title = "Mystery Data", x = "Value", y = "Count") +
+  theme_minimal()
+```
+
+## Likelihood Ratio Test
+
+The likelihood ratio test is used for nested models. It is a way to
+determine if added parameters are necessary to improve model fit.
+
+Let $\Theta$ be the parameter space of the full model and $\Theta_0$ the
+parameter space of the nested model with fewer parameters. Also let
+$\sup_{\theta}\mathcal{L}(\theta|X)$ be the value of the maximized
+likelihood function (so $\theta$ are the maximum likelihood estimates).
+
+The hypotheses we will test are \begin{eqnarray*}
+H_0: && \theta \in \Theta_0 \\
+H_1: && \theta \in \Theta,
+\end{eqnarray*} where $\Theta_0$ is the set of allowable parameter
+values for the reduced model that is nested within $\Theta$, the set of
+allowable parameter values for the full model.
+
+The log likelihod ratio test statistic is 
+\[
+\lambda = -2 [\sup_{\theta \in \Theta_0} \ln \mathcal{L}(\theta ~|~ X)
+                - \sup_{\theta \in \Theta} \ln \mathcal{L}(\theta|X)],
+\]
+
+which follows a $\chi^2$ distribution with $k$ degrees of freedom,
+where $k$ is the number of parameters by which
+$\Theta_0$ is reduced.
+
+Consider the gamma model with and without a shift. Let's modify the
+likelihood function to permit us to indicate that we might not want a
+shift parameter.
+
+```{r}
+ll.gamma.new <- function(pars,X,shift=0) {
+  # If shift=0 then the parameter c=0
+  # Reparameterize so that the model parameters are appropriately positive
+  k <- exp(pars[1])
+  alpha <- exp(pars[2])
+  c <- shift*exp(pars[3]) # Zero out c if shift=0
+  
+  ll <- -sum(dgamma(X-c,k,scale=alpha,log=TRUE))
+  
+   lls <- dgamma(X-c,k,scale=alpha,log=TRUE)
+   lls[abs(lls)==Inf] <- -500
+   ll <- -sum(lls)
+  return(ll)
+}
+```
+
+Now fit the gamma model to the correct RTs in the mystery data with and
+without the shift parameter.
+
+```{r}
+X <- rt[re==1 & stim==0]
+
+# Select starting values and fit the two models
+start.pars <- log(c(4,125,100)) # arbitrary
+fit.full.gamma <- optim(start.pars,ll.gamma.new,X=X,shift=1)
+fit.reduced.gamma <- optim(start.pars,ll.gamma.new,X=X,shift=0)
+```
+
+Note that the reduced model has a nonzero value for the shift. This
+doesn't matter; the algorithm tried different values for $c$ but none of
+those values changed anything because the likelihood function always
+zeroed them out. This is not the most efficient way to restrict a
+parameter but it is the easiest.
+
+Let's take a quick peek at these two fits by plotting the predicted
+densities over the RT histogram.
+
+```{r}
+x <- seq(min(X)-50,max(X)+10,length=200) # for plotting
+
+# Convert the log parameter values
+full.pars <- exp(fit.full.gamma$par)
+reduced.pars <- c(exp(fit.reduced.gamma$par),0)
+
+hist(X,breaks=30,freq=FALSE,xlab="Values of RT",main="")
+lines(x,dgamma(x-full.pars[3],full.pars[1],scale=full.pars[2]),
+      col="purple4")
+lines(x,dgamma(x,reduced.pars[1],scale=reduced.pars[2]),
+      col="orange4")
+legend("topright",c("Full Model",
+                    "Reduced"),lty=1,col=c("purple4","orange4"))
+```
+
+Compute $\lambda$ from the values of the maximized likelihoods. Remember
+that we multiplied the likelihood function by -1 so that optim() could
+use its default minimization, so multiply those values by -1 to flip it
+back. (Both likelihoods are negative so this will not matter but I like
+to be precise.)
+
+```{r}
+lambda <- -2*(-fit.reduced.gamma$value-(-fit.full.gamma$value))
+```
+
+There is one less parameter in the reduced model, so the $\lambda$
+statistic is distributed as a $\chi^2$ with 1 degree of freedom. The
+$p$-value of $\lambda$ is `r 1 - pchisq(lambda,1)`. This value is less
+than any reasonable $\alpha$ level so we reject the null hypothesis in
+favor of the full model.
+
+## Root Mean Squared Error of Prediction, $R^2$ and $\chi^2$ Goodness of Fit
+
+Models make predictions. With distributional analyses it is less clear
+what the prediction is. Is it the height of the density function vs. the
+histogram? Is it the quantiles of the distribution? Or is it something
+else?
+
+We often choose a "prediction" in the distributional context to be
+something related to how we fit the model. So, for example, we minimized
+the sum of squared errors between the observed and predicted quantiles
+to fit the gamma model. The predictions might then be the distribution
+quantiles. We might then, using the observed and predicted quantiles,
+compute the root mean squared error of prediction, $R^2$ or $\chi^2$ to
+evaluate how well the model fit.
+
+This is a way of "double dipping," using the data in two different ways
+for two purposes. One way is the minimization for the parameter
+estimation, and the other way is to quantify the goodness of fit using
+the same function that we used to estimate the parameters. This is not
+good statistical practice. It results in an overestimate of the goodness
+of fit of the model. The model may be overfit, so that the model
+accounts for random error, and will fail to generalize to new data.
+
+A way around this is to divide the data into a training set, to which
+the model is fit, and a test set, for which the goodness of fit is
+evaluated. This is called cross-validation, and is the best way to
+quantify the fit of a model without double dipping.
+
+```{r}
+# Do an 80% split of the data
+# Which RTs will be in the training set?
+indices <- sample(length(X),round(.8*length(X)),replace=FALSE)
+train <- X[indices]
+test <- X[-indices] # the rest will be the test set
+```
+
+The root mean squared error of prediction (RMSE) is the square root of
+the mean squared errors between observed values $Y$ and predicted values
+$\hat{Y}$. This makes sense in a regression context where $\hat{Y}$ is a
+function of a set of predictor variables $\{X\}$. Similarly, the squared
+correlation coefficient $R^2$ quantifies the extent to which a linear
+relationship describes the relationship between the prediction and the
+observations. The $\chi^2$ goodness of fit test examines how well the
+model distribution predicts the frequency distribution of the data.
+
+First fit the gamma model to the training RT data using least squares.
+
+```{r}
+# Construct the empirical cdf for the training data
+p <- seq(.01,.99,by=.01)
+times <- quantile(train,p)
+est.cdf <- cbind(times,p)
+
+# Choose starting values
+start.pars <- fit.full.gamma$par
+
+# Estimate the gamma parameters using least squares
+fit.train <- optim(start.pars,ss.gamma,est.cdf=est.cdf)
+gamma.pars <- exp(fit.train$par)
+```
+
+Use the test set to evaluate the fit. Start by computing the RMSE and
+$R^2$.
+
+```{r}
+# Compute the RMSE and R^2 based on the quantiles
+pred.quantiles <- qgamma(p,gamma.pars[1],scale=gamma.pars[2])+gamma.pars[3]
+obs.quantiles <- quantile(test,p)
+rmse <- sqrt(mean((pred.quantiles-obs.quantiles)^2))
+r2 <- cor(pred.quantiles,obs.quantiles)^2
+```
+
+The RMSE is `r rmse`, and $R^2$ is `r r2`.
+
+Finally do a $\chi^2$ goodness of fit test.
+
+```{r}
+# Compute the chi^2 GOF statistic based on the deciles.  There should be
+# 10% of the observations between each decile
+pred.deciles <- qgamma(seq(.1,.9,by=.1),gamma.pars[1],
+                       scale=gamma.pars[2])+gamma.pars[3]
+E <- length(test)*.1 # expected frequency
+
+# Compute the observed frequencies using hist
+O <- hist(test,breaks=c(min(test),pred.deciles,max(test)),plot=FALSE)$counts
+
+# Compute chi^2
+chi2 <- sum((E-O)^2/E)
+
+# Compute the p-value.  Note that the degrees of freedom is the number of 
+# cells minus 1
+1-pchisq(chi2,10-1)
+```
+
+### 8. Your turn
+
+The RMSE and $R^2$ statistics for a single model fit don't say much. We
+use them comparatively: fit two different models and use RMSE and $R^2$
+to determine which model is better.
+
+Fit two different models to the mystery data (stim=0) or to your own
+data using either least squares or MLE. Compute the RMSE and $R^2$ and
+determine which model fits better.
+
+## Kolmogorov-Smirnov Test
+
+Another way to evaluate goodness of fit is the Kolmogorov-Smirnov test.
+This test evaluates the null hypothesis $H_0: X \sim F(x)$ for some
+theoretical distribution $F(x)$. The test statistic is the maximum
+difference between the empirical distribution function and the
+theoretical (model) distribution function: $$
+D = \sup_x \left| \hat{F}(x) - F(x~|~\hat{\theta}) \right|,
+$$ where $\hat{\theta}$ are the parameter values estimated from the
+training set and $\hat{F}(x)$ is the empirical estimate for the *test*
+data. It is important to separate the estimation of the parameters from
+the test, because if the same data are used to estimate both $\theta$
+and $\hat{F}(x)$ then the test is invalid.
+
+```{r}
+# Use the test data to evaluate the null hypothesis given the best-fitting
+# gamma parameters estimated from the training data.
+ks.test(test-gamma.pars[3],y="pgamma",shape=gamma.pars[1],scale=gamma.pars[2])
+```
+
+We *fail to reject* the null hypothesis that the test data were sampled
+from a gamma distribution with parameters estimated from the training
+data, and might conclude that the gamma model fits the data well.
+
+# 9. Your turn: Real models
+
+What we've done so far is not very realistic. The gamma distribution is
+not very good for RT data (although it's flexible), and we've only
+looked at one condition (only one stimulus, only correct responses,
+etc.).
+
+So let's fit the ubiquitous drift diffusion model to some data. The
+drift diffusion model has at least 5 parameters: \begin{eqnarray*}
+a: && \text{Response threshold for response } A \\
+z: && \text{Starting point, often } a/2 \\
+\nu_A: && \text{drift rate for responses to stimulus} A \\
+\nu_B: && \text{drift rate for responses to stimulus} B \\
+t_0:
+&& \text{nondecision time (shift)}
+\end{eqnarray*}
+
+Here are two websites that will be useful:
+
+1. (<https://www.ejwagenmakers.com/EZ.html>) gives a web interface for
+estimating diffusion model parameters for the single condition, two
+responses situation. This is a great way to generate good starting
+values for a least squares or MLE of the drift diffusion model.
+2. A vignette that uses the rtdists package for two stimuli by two
+responses is
+[here](https://cran.r-project.org/web/packages/rtdists/vignettes/reanalysis_rr98.html).
+
+Following the vignette, fit the drift diffusion model to the mystery (or
+your own) data. Here's what you'll need to do:
+
+1.  Generate starting values.
+2.  Format the data appropriately so it can be passed to the objective
+    function.
+3.  Code up an objective function, inside of which you need to:
+    a.  Reparameterize to ensure the parameters behave, and
+    b.  Catch any likelihood values equal to 0 (if you decide to use
+        MLE).
+4.  Pass the data and the model through the optim() function.
+5.  Transform the parameters back to meaningful values.
+6.  Evaluate the model fit with function comparisons, QQ plots, or one
+    of the other methods presented above.
+7. Interpret the parameters.
+
+    
+*Note: Sometimes it is important to _iterate_ the optimization routine because poor starting values may lead to poor estimated values.  But those poor estimated values can be used as new starting values!*
+
+```{r}
+# Insert your code here
+```
+
