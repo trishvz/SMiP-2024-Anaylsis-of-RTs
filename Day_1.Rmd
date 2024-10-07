@@ -29,6 +29,7 @@ library("muhaz")
 library("moments")
 library('gamlss')
 library('PWEXP')
+library('ggplot2')
 ```
 
 Load the Wagenmakers dataset
@@ -829,7 +830,6 @@ We're going to use the mystery dataset for this part.
 ```{r}
 load("mystery.Rdata")
 
-library(ggplot2)
 
 # Mystery data has two stimulus conditions.  For now, just look at one of them
 # (stim = 0).
