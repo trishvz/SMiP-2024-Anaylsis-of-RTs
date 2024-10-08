@@ -1,0 +1,1009 @@
+---
+title: "Day 2 - Bayesian Modeling of Response Time"
+author: "TVZ"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Here are some of the libraries that we're going to need.
+```{r}
+library("rtdists")
+library("extraDistr")
+library("rstan")
+library("brms")
+library("gamlss.dist")
+library("tidyverse")
+library('coda')
+```
+
+Load the Wagenmakers and mystery datasets
+```{r}
+load("wagenmakers.Rdata")
+load("mystery.Rdata")
+```
+
+Here is a function to simulate the ex-Gaussian distribution and the ex-Gaussian pdf, because I hate all the other ones. Your mileage may vary.
+```{r}
+# A function to simulate the ex-Gaussian
+# Mean = mu + tau
+rexgauss <- function(N,mu,sigma,tau) {
+  if(sigma < 1e-10) 
+  {f <- mu + tau*rexp(N,1)} else if (tau < 1e-10) { 
+      f <- rnorm(N,mu,sigma) } else {
+	    f<- rnorm(N,mu,sigma) + tau*rexp(N,1) } 
+	return(f)
+}
+
+# The ex-Gaussian pdf
+dexgauss <- function(t,mu,sigma,tau,log=TRUE) {
+  if (sigma < 1e-10) {
+    f <- dexp(t - mu,1/tau,log=TRUE)} else if (tau < 1e-10) { 
+      f <- dnorm(t,mu,sigma) } else {
+	f<- -log(tau) + (mu-t)/tau + sigma^2/2/tau^2 +
+	    log(pnorm((t-mu)/sigma - sigma/tau))}
+	if (log==FALSE) f<-exp(f)
+	return(f)
+	}
+```
+
+
+# Basic Bayes
+
+Everything we did yesterday assumed that a model's parameters are constant and that our job was to find them (via point estimation).  The Bayesian approach assumes that parameters are random variables in the same way the data are.  
+
+Before we observe the data we have *prior* beliefs about the model parameters $\theta$ characterized by a probability or density function $\pi(\theta)$.  The model provides a likelihood $\mathcal{L}(\theta ~|~ Y)$ for the data $Y$, remembering that in this characterization the likelihood is a function of the parameters $\theta$; the data $Y$ are fixed.  Using Bayes' Theorem, we then update our beliefs about the prior as the posterior
+
+\[
+\pi(\theta ~|~ Y) = \dfrac{\mathcal{L}(\theta ~|~ Y) \pi(\theta)}{\int_{\theta \in \Omega_{\theta}} \mathcal{L}(\theta ~|~ Y) \pi(\theta)}
+\]
+
+Because the denominator above (which is an alternative way of expressing $f_Y(y)$, the joint density of the (vector-valued) data $Y$) is a constant with respect to $\theta$ and often intractable, we write
+
+\[
+\pi(\theta ~|~ Y) \propto \mathcal{L}(\theta ~|~ Y) \pi(\theta),
+\]
+
+where $\propto$ is read "proportional to."  It means that we don't have a closed-form expression for the posterior, but we can often figure it out by looking at the *kernel* of the function, which is the part that includes $\theta$.
+
+Let's demonstrate how beliefs can be "updated" after observing some data. Consider a rare disease, that is found in the population with probability $p=0.01$.  A patient is tested for the disease using a laboratory test with sensitivity $Pr($test positive $|$ sick$) =0.99$ and specificity $Pr($test negative $|$ not sick$) =0.99$.  
+
+The parameter of interest in this context is $p = Pr(\text{sick})$.  The data is the test result, positive or negative, whose likelihood is based on the Bernoulli model.  The Bernoulli model has probability function
+\[
+f_Y(y) = p^y (1-p)^{1-y} \mathcal{I}(y \in \{0,1\}),
+\]
+where $y=0$ if the test comes back negative and $1$ if the test comes back positive.
+
+The following simulation computes the posterior probability of $p$ given that the test outcome is positive, or $Y=1$.  Our prior belief for $p$ will be 0.01, what we know the population base rate to be.
+
+```{r}
+bignum <- 1000000 # Need a big population because the probabilities are small
+# Our prior belief about p comes from the population "base rate":
+p <- .01
+
+# Sensitivity and specificity
+sens <- .99
+spec <- .99
+
+# Generate a random population with p = .01.  If population[i] = 1 the individual is sick.
+population <- rbinom(bignum,1,p)
+
+# Probabilities ps of testing positive
+# Sick people (population=1) have ps=sens, well people (population=0) have ps=1-spec
+ps <- sens^(population)*(1-spec)^(1-population)
+
+# Test everyone
+test <- rbinom(bignum,1,ps) # Bernoulli likelihood
+
+# What is the proportion of people who tested positive who are really sick?  Compute the proportion of positive test results that are for sick people
+new.p <- sum(population==1 & test ==1)/sum(test==1)
+
+# Compare this result with Bayes' Theorem:
+new.p
+sens*p/(sens*p + (1-spec)*(1-p))
+rm(population,ps,test) # Delete those big vectors
+```
+
+Our prior belief that a person is sick ($p = 0.01$) is updated to $p~|~(Y=1) = 0.50$ (using Bayes' Theorem) or `r new.p` (via simulation).
+
+# Likelihoods and Kernels
+
+A model is instantiated in the likelihood function.  For example, if $Y \sim \Exp(\theta)$, an exponential random variable with mean $\theta$ and variance $\theta^2$, then the sample $\{Y_1, Y_2, \ldots, Y_N\}$ has likelihood
+
+\begin{eqnarray*}
+\mathcal{L}(k,\theta ~|~ Y) $ = $ \prod_{i=1}^N f_Y(Y_i~|~k,\theta) \\
+  & = & \prod_{i=1}^N \theta e^{\theta Y_i} \\
+  & = & \theta^N \exp\left(-\theta \sum_{i=1}^N Y_i\right) \\
+\end{eqnarray*}
+
+Let's select a $\Gamma(\alpha,\beta)$ prior for $\theta$, such that
+\[
+\pi(\theta) = \dfrac{\beta^{\alpha}}{\Gamma(\alpha)} \theta^{\alpha-1} \exp(-\theta \beta).
+\]
+
+Then the posterior for $\theta$ is
+\begin{eqnarray*}
+\pi(\theta~|~Y) & \propto & \theta^N \exp\left(-\theta \sum_{i=1}^N Y_i\right)  \dfrac{\beta^{\alpha}}{\Gamma(\alpha)} \theta^{\alpha-1} \exp(-\theta \beta) \\
+& & = \dfrac{\beta^{\alpha}}{\Gamma(\alpha)} \theta^{N + \alpha - 1} \exp\left[ -\theta (\sum_{i=1}^N Y_i + \beta)].
+\end{eqnarray*}
+
+The *kernel* of this posterior consists of all the terms with $\theta$ in them, so, eliminating $\dfrac{\beta^{\alpha}}{\Gamma(\alpha)}$, 
+\[
+\pi(\theta~|~Y) \propto  \theta^{N + \alpha - 1} \exp\left[ -\theta (\sum_{i=1}^N Y_i + \beta)].
+\]
+
+Now look back at the gamma density function, where $\theta$ was the random variable:
+\[
+\pi(\theta) = \dfrac{\beta^{\alpha}}{\Gamma(\alpha)} \theta^{\alpha-1} \exp(-\theta \beta).
+\]
+
+Eliminating everything that doesn't have $\theta$ in it we get
+\[
+\pi(\theta) \propto \theta^{\alpha-1} \exp(-\theta \beta).
+\]
+
+This is the gamma *kernel*, or the *unnormalized* form of the density; it doesn't integrate to 1.0.  The part that we eliminated is called the normalizing constant: $\dfrac{\beta^{\alpha}}{\Gamma(\alpha)}$.  If we integrate the gamma kernel only without the normalizing constant, we get $\left( \dfrac{\beta^{\alpha}}{\Gamma(\alpha)} \right)^{-1}.$
+
+If the gamma kernel takes this form, look back now at the posterior kernel of $\pi(\theta ~|~ Y)$.  You can see that this is also a gamma kernel with
+\begin{eqnarray*}
+\alpha & \rightarrow & N + \alpha \\
+\beta & \rightarrow & \beta + \sum_{i=1}^N Y_i.
+\end{eqnarray*}
+
+The fact that both the prior for $\theta$ and the posterior for $\theta$ are gamma distributions means that the gamma distribution is the *conjugate prior* for the exponential distribution.  
+
+Models with conjugate priors are especially easy to work with.  Unfortunately they don't occur naturally very often.
+
+## The Beta-Binomial Model
+
+Suppose you're going to give 10 students a multiple-choice exam with 20 questions. You suspect that they haven't studied very hard but you're unwilling to give a strong prior on the probability $q$ that any student will get any particular question right.  If they have studied, $q$ should be closer to 1.  If they haven't studied, $q$ should be closer to chance (e.g., $q=0.20$ if each question has 5 alternatives). You administer the exam and observe 10 test grades $Y = \{Y_1, Y_2, \ldots, Y_{10}\}$.  
+
+The beta-binomial model provides a good framework for Bayesian inference about $q$.  The probability distribution of each $Y_i$ is binomial with parameters $N=20$ and $q$.  The prior distribution of $q$ that we will use is the beta distribution, which supports values of $q$ between 0 and 1.
+
+The beta distribution has two parameters $a$ and $b$ that determine how close the values of $q$ are to 0 or 1 (or both).  If $a=b$ the distribution is symmetric around $0.5$.  The larger the values of $a=b$, the tighter the distribution is around $0.5$.  The smaller they are, the more the density will spread to 0 and 1.  
+
+```{r}
+# Peek at the beta distribution
+p <- seq(0,1,length=100) # for plotting
+
+par(mfrow=c(1,2))
+# Plots for a=b
+plot(p,dbeta(p,1,1),type='l',xlab="Values of q",ylab="",ylim=c(0,4))
+lines(p,dbeta(p,.2,.2),col="orange4")
+lines(p,dbeta(p,4,4),col="purple4")
+legend("top",legend=c("a=b=1","a=b=0.2","a=b=4"),lty=1,col=c("black","orange4","purple4"))
+
+plot(p,dbeta(p,1,1),type='l',xlab="Values of q",ylab="",ylim=c(0,4))
+lines(p,dbeta(p,1,3),col="orange4")
+lines(p,dbeta(p,3,1),col="purple4")
+legend("top",legend=c("a=b=1","1,3","3,1"),lty=1,col=c("black","orange4","purple4"))
+```
+
+Take special note of the $B(1,1)$ distribution, which has a flat density equal to 1 from 0 to 1.  This is the standard uniform distribution, and we call it a noninformative prior: it gives equal weight to all possible values of $q$ and is the prior we use when we don't want to commit.
+
+## Your turn
+
+Give your students the exam and get back 10 test scores.  Using the noniformative $B(1,1)$ prior on $q$, try to infer the true value of $q$.  Before you start, click the "Connections" tab in the upper right of RStudio so you can't see the value of $q$.
+
+```{r}
+# Set test size
+N <- 20
+# Set sample size
+M <- 10
+# Set prior parameters
+a <- b <- 1
+# Sample a value of q from the prior - don't peek!  It's secret!
+q <- rbeta(1,a,b)
+```
+
+Your class now has a value of $q$ that is (if you don't peek) unknown to you.  Simulate the test scores.
+
+```{r}
+# Simulate the test scores
+Y <- rbinom(M,N,q)
+```
+
+Because the $B(a,b)$ prior is conjugate for the binomial model, we know that the posterior distribution for $q$ is given by
+\[
+q ~|~ Y \sim B\left( \sum_{i=1}^N Y_i + a,NM - \sum_{i=1}^N Y_i + b \right).
+\]
+
+```{r}
+# Compute the posterior
+q.values <- seq(0,1,length.out=200) # for plotting
+pdf.values <- dbeta(q.values,sum(Y)+a,N*M-sum(Y)+b)
+
+# Plot the posterior 
+par(mfrow=c(1,1))
+plot(q.values,pdf.values,xlab='Values of q',
+     ylab='Beta PDF',type='l')
+```
+
+The posterior strongly suggests what the value of $q$ might be.  Let's do a few things before we peek.  
+
+First, add the prior to the plot.  The extent to which the posterior is different from the prior tells us how much the model "learned" from the data.  Think about the posterior as a kind of average between the data and the prior.  If the posterior is similar to the prior, the prior is dominating the inference: the data isn't adding anything.  If there's a big difference, the data is informative and the model has learned from it.
+
+```{r}
+# Add the prior to the plot
+plot(q.values,pdf.values,xlab='Values of q',
+     ylab='Beta PDF',type='l')
+lines(q.values,dbeta(q.values,a,b),col='blue')
+```
+
+The posterior (in black) shows significant change from the noninformative prior (in blue).
+
+Second, let's generate some Bayesian *point estimates* for $q$.  We can look at the posterior mean or the posterior mode (the maximum *a posteriori* or MAP estimate).  The mean of the $B(a,b)$ distribution is $a/(a+b)$ and the mode is $(a-1)/(a + b - 2)$ (for $a,b>1$).  
+
+```{r}
+# Compute the parameters of the posterior beta distribution 
+post.a <- sum(Y)+a
+post.b <- N*M-sum(Y)+b
+
+post.mean <- post.a/(post.a + post.b)
+MAP <- (post.a-1)/(post.a + post.b - 2)
+
+# Add these points to the plot
+plot(q.values,pdf.values,xlab='Values of q',
+     ylab='Beta PDF',type='l')
+lines(q.values,dbeta(q.values,a,b),col='blue')
+abline(v=post.mean,col='purple4')
+abline(v=MAP,col='purple4')
+```
+
+The MAP `r MAP` and the posterior mean `r post.mean` are very similar because the posterior is nearly symmetric.
+
+Finally, let's compute a 95% *credible set*, the Bayesian equivalent of a confidence interval. There are a few ways to do this, but we'll do it by way of equal tails, selecting the values of $q$ that cut of 2.5% of the upper and lower tails of the posterior distribution.  
+
+```{r}
+# Credible set
+ci = .95 # 95%
+set <- qbeta(c((1-ci)/2,1-(1-ci)/2),post.a,post.b)
+
+# Add the credible set to the plot.
+plot(q.values,pdf.values,xlab='Values of q',
+     ylab='Beta PDF',type='l')
+lines(q.values,dbeta(q.values,a,b),col='blue')
+abline(v=post.mean,col='purple4')
+abline(v=MAP,col='purple4')
+abline(v=set,lty=3,col='orange4')
+```
+
+So now 95% of the posterior mass is concentrated between the values `r set[1]` and `r set[2]`, which defines the 95% credible set.  You can play around with the value of the ci variable to see how the width of the credible set changes with different levels of "confidence."
+
+The difference between the Bayesian and frequentist approaches is in what you are allowed to say about the parameter $q$.  If the exam questions have 5 alternatives, then the null hypothesis you might test is 
+\[
+H_0: q \le 0.20,
+\]
+the guessing probability, versus the alternative
+\[
+H_1: q \ge 0.20.
+\]
+Under the Binomial$(N,q)$ model, each test score $Y_i$ is drawn from a binomial distribution with mean $Nq$ and variance $Nq(1-q)$, and so the mean $\overline{Y} \sim \mathcal{N}\left(Nq,\dfrac{Nq(1-q)}{M}\right).  The test statistic would then be 
+\[
+z_{\overline{Y}} = \dfrac{\overline{Y} - (20)(0.20)}{\sqrt{(20)(0.20)(0.80)/10}}. 
+\]
+
+```{r}
+# Do the z-test
+z <- (mean(Y) - N*.2)/sqrt(N*.2*.8/M)
+p.value <- 1 - pnorm(z) # One-tailed test
+cat("z = ",z,", p-value = ",p.value)
+```
+
+The p-value is the probability of obtaining a sample mean greater than or equal to the observed $\overline{Y} = \overline{y} =$`r mean(Y)` under the hypothesis that $q=0.20$: $Pr(\overline{Y} \ge \overline{y} ~|~ q = 0.20)$.  This probability says nothing about the true value of $q$; if it is sufficiently small we reject $H_0$, but we still can't say much about $q$.  
+
+The posterior distribution of $q$ allows us to make probability statements about $q$.  We can compute the probabilities that the null and alternative hypotheses are true:
+```{r}
+# Pr(q <= 0.20~|~Y)
+p.H0 <- pbeta(0.20,post.a,post.b)
+
+# Pr(q >= 0.20~|~Y)
+p.H1 <- 1 - pbeta(0.20,post.a,post.b)
+
+cat("Pr(H0~|~Y) = ",p.H0," and Pr(H1~|~Y) = ",p.H1)
+```
+
+Are you ready to peek at the true value of $q$?
+
+```{r}
+plot(q.values,pdf.values,xlab='Values of q',
+     ylab='Beta PDF',type='l')
+lines(q.values,dbeta(q.values,a,b),col='blue')
+abline(v=post.mean,col='purple4')
+abline(v=MAP,col='purple4')
+abline(v=set,lty=3,col='orange4')
+abline(v=q,col='green')
+```
+
+The true value of $q$ is `r q`, which should be within the credible set limits and very close to the posterior mean and MAP point estimates.
+
+Bayesian point estimators often are "better" than other (e.g., least squares or MLE) estimators.  However, as sample size $M$ increases, Bayesian "central limit" theorems guarantee that the posterior mean will approach the MLE of the parameter and the posterior itself will approach a normal distribution.
+
+## Which Estimator Was Better?
+
+"Good" estimators have low variance and low bias.  Together we can compute the Mean Squared Error (MSE) of an estimator $\hat{\theta}$ as
+\[
+MSE(\theta) = Bias(\theta) + Var(\theta).
+\]
+
+Consider for the beta-binomial the estimate $\tilde{p} = \overline{Y}$, the mean of the data, versus the estimate $\hat{p} = \overline{p}~|~Y$, the posterior mean.  Which has the smallest MSE?
+
+```{r}
+# Contrast the MS of the frequentist MVUE estimator 
+# with the MS of the posterior mean estimator.
+
+# Define a function for the MS of the MVUE estimator (Y/N):
+mvue.ms <- function(q,N) q*(1-q)/N
+
+# Define a function for the MS of the posterior mean 
+# ((Y+1)/(N+2)):
+bayes.ms <- function(q,N) ((1-2*q)/(N+2))^2 
+                          + N*q*(1-q)/(N+2)^2
+
+# Plot one on top of the other:
+q <- seq(0,1,by=.01)
+par(mfrow=c(1,1))
+plot(q,mvue.ms(q,10),type='l',
+     xlab='Values of q',ylab='MS(estimate)')
+lines(q,bayes.ms(q,10),lty=3)
+legend("topright",c('Bayes','Frequentist'),lty=c(3,1))
+```
+
+# Bayesian RT Analyses
+
+Not many "real" modeling problems (e.g., RT models) have conjugate priors, or even likelihoods with closed-form expressions.  For these kinds of problems we estimate the posterior distribution by sampling from them a large number of times.  There are a number of algorithms for this kind of sampling, and almost all of them are finicky, requiring tuning of algorithm parameters.
+
+## A simple MCMC sampler
+
+The earliest of these samplers and the easiest to understand is the Markov Chain Monte Carlo (MCMC) sampler.  It is useful to walk through this sampler with a more realistic problem.  We'll use the ex-Gaussian distribution as a data model (but you can change that if you want).
+
+First we'll need to define the ex-Gaussian likelihood function.  Remember to reparameterize so that the variance and exponential parameters are positive and add a correction for -Inf log likelihood values.
+
+```{r}
+# The ex-Gaussian likelihood function
+# pars is a 3-dimensional vector containing mu, sigma and tau (in that order)
+# data is a vector of RT measurements
+exg.likelihood <- function(pars,data) {
+  # REPARAMETERIZE so that tau and sigma are always positive
+  mu <- pars[1]
+  sigma <- exp(pars[2])
+  tau <- exp(pars[3])
+  ln.like <- dexgauss(data,mu=mu,sigma=sigma,tau=tau,log=TRUE)
+  
+  # What happens if the likelihood of an observation is 0?
+  ln.like[ln.like==-Inf] <- -500
+  ln.like <- sum(ln.like) # Note no negative!  We are not optimizing.
+  return(ln.like)
+   }
+```
+
+We'll use simulated data for this, but you can use real data if you feel adventurous.
+
+```{r}
+take <- rexgauss(1000,mu=300,sigma=50,tau=200)
+```
+
+MCMC sampling obtains "chains" of parameter values.  The longer the chain the better, keeping in mind that the longer the chains the longer the execution time.
+
+The algorithm starts with an initial set of parameter values.  It evaluates the likelihood at that initial state.  It then generates new candidate values by sampling from a *proposal* distribution, which might be the prior or could be something else. In the code below, the proposal is generated from a normal distribution with mean equal to the state of the chain.  
+
+The algorithm must decide whether the proposal values are to be accepted (and so become the new state) or rejected, and the old values are used again for the next step.  If the value of the likelihood with the proposal is higher than the likelihood under the current state, the proposal is accepted.  If it is less, the proposal is accepted with a probability that is proportional to the ratio of the new likelihood to the old.  This accept/reject decision is called a *Metropolis-Hastings step*.  We "tune" this step so that the overall acceptance probability is around 0.20, usually by adjusting the variance of proposal distribution.  
+
+The result of MCMC sampling is the long chain of parameter values.  The longer the chain the better, keeping in mind that the longer the chain the longer the execution time.  When the sampler has converged, and the proposed values have become a sample from the desired posterior (which is guaranteed to happen eventually under the Markovian nature of the chain), we can estimate the posterior distribution from the values in the chain.
+
+The following steps estimate the posteriors of the ex-Gaussian parameters using Metropolis-Hastings MCMC sampling.
+
+```{r}
+# Set the number of samples (chain length)
+N <- 10000      # Chain length 
+```
+
+We initialize the chains (one for each parameter) at values close to those that generated the data.  This is, of course, cheating.  As with least-squares or MLE, picking good starting values is a significant problem and there are a number of ways to address it.  I always start with method of moments.
+
+```{r}
+# Initialize the parameter chains
+mu <- sigma <- tau <- vector()
+# (Note that we are starting the chains around the true values -- cheating!)
+mu[1] <- rnorm(1,300,1)
+sigma[1] <- rnorm(1,log(50),1)
+tau[1] <- rnorm(1,log(200),1)
+```
+
+We now evaluate the starting likelihood of the parameters given the data.  Remember that the idea is to wander through the parameter space, accepting new parameter values when they giver higher likelihoods than the old parameters, or accepting them with some probability if the new likelihood is lower.  
+
+Notice in the following chunk that we are working with the *log* posterior, which allows us to work with the sum of the log likelihood and the log prior.  Evaluating whether the posterior is higher or lower after a step is the same as evaluating whether the log posterior is higher or lower.
+
+```{r results='hide'}
+posts <- vector()
+    # Compute the  likelihood of the data under the initial parameter
+    # values
+    like.old <- exg.likelihood(pars=c(mu[1],sigma[1],tau[1]),data=take)
+
+    # Assume uninformative priors, so log prior = 0.  Uncomment the lines for normal priors.
+    post.old <- like.old + 0
+       # max(dnorm(mu[1],300,1,log=TRUE),-750)+
+       # max(dnorm(tau[1],log(200),1,log=TRUE),-750)+
+       # max(dnorm(sigma[1],log(50),1,log=TRUE),-750)
+
+    # Save the value of the posterior for later
+    posts[1] <- post.old
+
+    # We need to know the acceptance rate at the end, which should be around 20%.  If convergence seems to be a problem, we'll need to rerun the sampler after retuning the proposal distributions.  These are the normal distributions for theta.star below; increase the variances to decrease the acceptance rate.
+    reject <- N # chain length
+
+    for (i in 2:N) {
+        print(i) # uncomment this line if things get slow so you can monitor progress
+       # We need this for a Metropolis-Hastings step
+       post.old <- posts[i-1]
+
+       # Generate new proposals
+       mu.star <- rnorm(1,mu[i-1],1)
+       sigma.star <- rnorm(1,sigma[i-1],.2)
+       tau.star <- rnorm(1,tau[i-1],.2)
+       
+       # Compute the new likelihood and posterior    
+       like.star <- exg.likelihood(pars=c(mu.star,sigma.star,tau.star),
+                                   data=take)
+       # Uncomment the lines for normal priors
+       post.star <- like.star + 0
+          # max(dnorm(mu[i-1],300,1,log=TRUE),-750)+
+          # max(dnorm(tau[i-1],log(200),1,log=TRUE),-750)+
+          # max(dnorm(sigma[i-1],log(50),1,log=TRUE),-750)
+
+   #  Assume the new values are going to be bad and store them for next time
+       mu[i] <- mu[i-1]
+       tau[i] <- tau[i-1]
+       sigma[i] <- sigma[i-1]
+       posts[i] <- posts[i-1]
+    
+    # Metropolis-Hastings evaluation
+    # Replace the old parameters if the new ones are better
+       ratio <- exp(post.star - post.old)
+       if(runif(1) <= min(c(1,ratio))) { 
+          # update the chains
+          mu[i] <- mu.star
+          tau[i] <- tau.star
+          sigma[i] <- sigma.star
+          
+          # store the posterior and count the acceptance
+	        posts[i] <- post.star
+	        reject <- reject - 1 
+       }
+      # Because this sampler can be expensive, if you're on an old or slow machine, store the chains every 100 proposals so you don't have to restart from scratch if it crashes.
+      # if (i%%100==0) save.image(file='image_mcmc.Rdata')
+}
+```
+
+We assume that the chains haven't converged yet at the beginning, so we'll remove a "burnin" period.
+
+```{r}
+burnin <- .1*N
+
+# Remove the burnin period and reparameterize
+mu <- mu[(burnin+1):length(mu)]
+sigma <- exp(sigma[(burnin+1):length(sigma)])
+tau <- exp(tau[(burnin+1):length(tau)])
+```
+
+Now examine the estimated posteriors and the traceplots of the chains for convergence.  You'll use the coda package for this.  Note that it is difficult to determine convergence with a high degree of confidence when you have only a single chain for each parameter.
+
+```{r}
+# Convert the chains to "mcmc" objects so we can use coda routines.
+mu.mcmc <- as.mcmc(mu)
+sigma.mcmc <- as.mcmc(sigma)
+tau.mcmc <- as.mcmc(tau)
+
+# Examine the traceplots; the chains should look *stationary* and of *constant variance*.
+par(mfrow=c(3,1))
+traceplot(mu.mcmc,ylab="mu")
+traceplot(sigma.mcmc,ylab="sigma")
+traceplot(tau.mcmc,ylab="tau")
+```
+
+How do these traceplots look?  Does it look like the chains are oscillating around a constant mean?  If not, what does that suggest?
+
+There are a number of statistical tests we can perform to determine convergence.  Most of them require that we obtain more than one chain for each parameter.  One that does not is the Geweke diagnostic, which compares the mean from the first part of the chain to the mean from the last.  You can also plot the evolution of this statistic.
+```{r}
+geweke.diag(mu.mcmc)
+geweke.diag(sigma.mcmc)
+geweke.diag(tau.mcmc)
+
+geweke.plot(mu.mcmc,main="mu")
+geweke.plot(sigma.mcmc,main="sigma")
+geweke.plot(tau.mcmc,main="tau")
+par(mfrow=c(1,1))  # Reset the plot parameters
+```
+
+
+```{r}
+# Plot the posterior estimates
+par(mfrow=c(3,1))
+hist(mu[(burnin+1):N],breaks=50,freq=FALSE,main="",xlab="Values of mu")
+hist(sigma[(burnin+1):N],breaks=50,freq=FALSE,main="",xlab="Values of sigma")
+hist(tau[(burnin+1):N],breaks=50,freq=FALSE,main="",xlab="Values of tau")
+```
+
+Compute the posterior mean estimates of $\mu$, $\sigma$ and $\tau$ and the 95% credible sets.
+
+```{r}
+mu.post <- mean(mu)
+sigma.post <- mean(sigma)
+tau.post <- mean(tau)
+
+mu.set <- quantile(mu,c(.025,.975))
+sigma.set <- quantile(sigma,c(.025,.975))
+tau.set <- quantile(tau,c(.025,.975))
+
+# Add these to the posterior histograms
+par(mfrow=c(3,1))
+hist(mu[(burnin+1):N],breaks=50,freq=FALSE,main="",xlab="Values of mu")
+abline(v=mu.post,col='blue')
+abline(v=mu.set,col='orange4',lty=2)
+
+hist(sigma[(burnin+1):N],breaks=50,freq=FALSE,main="",xlab="Values of sigma")
+abline(v=sigma.post,col='blue')
+abline(v=sigma.set,col='orange4',lty=2)
+
+hist(tau[(burnin+1):N],breaks=50,freq=FALSE,main="",xlab="Values of tau")
+abline(v=tau.post,col='blue')
+abline(v=tau.set,col='orange4',lty=2)
+```
+
+Add the true values to the plot
+```{r}
+par(mfrow=c(3,1))
+hist(mu[(burnin+1):N],breaks=50,freq=FALSE)
+abline(v=mu.post,col='blue')
+abline(v=mu.set,col='orange4',lty=2)
+abline(v=300,col="purple4")
+
+hist(sigma[(burnin+1):N],breaks=50,freq=FALSE)
+abline(v=sigma.post,col='blue')
+abline(v=sigma.set,col='orange4',lty=2)
+abline(v=50,col="purple4")
+
+hist(tau[(burnin+1):N],breaks=50,freq=FALSE)
+abline(v=tau.post,col='blue')
+abline(v=tau.set,col='orange4',lty=2)
+abline(v=200,col="purple4")
+```
+
+### Your turn
+
+Use the code above to fit a model to the mystery data or to your own dataset.  Note that we only fit a single set of RTs with the ex-Gaussian model.  If you want to fit multiple conditions you will have to reformulate the likelihood as you did for the MLE of the diffusion model.  If you're using your own dataset you will probably make more progress if you subset the data to a single condition (in which you don't have to worry about effects of stimuli or errors, e.g.).
+
+```{r}
+# Insert your code here
+```
+
+# Rstan
+
+Stan is a powerful probabilistic programming language for Bayesian modeling.  You can work with stan in R by installing the rstan package.  This allows you to work with the chains generated by the stan sampler using all of R's statistical functions.
+
+The brms package generates the stan programming language for you, but it has a steep learning curve.  It's also important to understand how rstan (and stan) work in case you run into something that brms can't fix for you.  (Personally, I find it easier to work with rstan rather than learning a whole bunch of new brms commands.)
+
+```{r}
+library('rstan') # tidy overwrites some important rstan functions, so read it in again
+```
+
+The best part of stan is how easy it makes it to do hierarchical modeling.  We don't have enough time to go into hierarchical models, unfortunately.  Just as a quick dive into rstan, the following chunks of code revisit the beta-binomial model.
+
+Remember we had 10 students taking a test with 20 questions.  Hide the Environment tab as before.
+
+```{r}
+# Generate the secret value of q
+q <- rbeta(1,1,1)
+```
+
+Now simulate the 10 test scores.
+```{r}
+# Set test size
+N <- 20
+# Set sample size
+M <- 10
+# Simulate the data set
+Y <- rbinom(M,N,q)
+
+# Make a list of data for stan:
+data <- list(Y=Y,N=N,M=length(Y))
+```
+
+Now we do the hard part: generating the code for stan.  If we were working with stan directly this code would be in its own script file that we would compile.  But we're in R, so the code will actually be a big long character variable. The double backslashes "//" are interpreted by stan as comments and are not compiled.  Note that, unlike in R, stan variables have to be identified (declared) as integers, real, vectors, matrices, etc.
+
+Stan code has at least three blocks: data{}, parameters{} and model{}.
+
+```{r}
+# One parameter beta-binomial model
+model.script <- "
+// Data block.  Declare the variables passed via data:
+data {
+   int N;      // Test size
+   int M;      // Number of observations
+   int Y[M];   // Test scores
+}
+// Parameter block. Declare the model parameter q:
+parameters {
+   real<lower=0,upper=1> q;  // Probability of correct response
+}
+// Model block.  Define the beta-binomial model:
+model {
+   q ~ beta(2,2);               // Beta prior on q
+   for (i in 1:M) {
+     Y[i] ~ binomial(N,q);      // Binomial likelihood for each Y
+   }
+}"
+```
+
+With the stan code written, we pass the model.script character variable to the stan() function.
+```{r}
+# Pass the model and data to stan for compilation and sampling:
+fit <- stan(model_code = model.script,
+            data=data,
+            iter=10000,
+            warmup=2000,
+            thin=10,
+            chains=3)
+```
+
+Now examine the model parameter chains.  There are a lot of
+things you can request here; check the stan manual.
+
+```{r}
+ print(fit, digits_summary=3, pars='q',
+       probs = c(.025, .5, .975))
+```
+
+The "Rhat" statistic should be equal to or very close to one for convergence.  But if Rhat is "very close" to one the chains may still look like they haven't converged.  Check convergence visually, and at first set inc_warmup=TRUE to see how the chains have moved away from their initial values.  We want the traceplots to look like flat, rectangular fuzzy caterpillars.
+
+```{r}
+fit.mcmc <- As.mcmc.list(fit) # Convert the stan fit to an mcmc object 
+traceplot(fit.mcmc)
+```
+
+Now extract the chains from the stan output so we can do more stuff:
+
+```{r}
+# The extract command is also used by tidy so 
+post <- rstan::extract(fit,pars='q')
+
+# Compute the posterior mean of q, the 95% credible set, and examine
+# the posterior
+mean.q <- mean(post$q)
+plot(density(post$q),xlim=c(0,1),xlab="Values of q",main="")
+
+# Plot the prior over the posterior
+q.x <- seq(0,1,length=500)
+lines(q.x,dbeta(q.x,2,2),col='red')
+```
+
+## Your turn!
+
+This was a dumb little example.  Modify the stan routine to fit a more interesting model (but not too interesting) to RT data, either your own or the Wagenmakers or mystery dataset.
+
+```{r}
+# Insert your code here
+```
+
+## The Drift Diffusion Model
+
+The brms package in R will permit fairly easy Bayesian analysis of fits of the drift diffusion model, as well as other models like the ex-Gaussian.  Of course, as the model becomes more complex the analysis procedure gets trickier.  
+
+The package can fit a wide variety of diffusion models and can handle hierarchical models for complex experimental designs.  We won't have time to explore everything the package can do, but we can fit a Bayesian model to the mystery data.
+
+What follows is some code borrowed from [Singman](http://singmann.org/wiener-model-analysis-with-brms-part-i/).  It is not complete!  The model is not appropriate for the data.  Feel free to modify the code to make it better.
+
+The first step is to reshape the data into a "tibble" (data frame).
+
+```{r}
+# Reshape the mystery data
+# set.seed(827653) # This is for replicability, if needed
+n <- length(rt)
+data <- tibble(stimulus = stim,rt = rt,choice = re)
+```
+
+We use the brm() command to fit the model.  Computation is actually done by rstan, which we'll discuss below.  The brm routine generates the stan code that is passed to rstan.
+
+There are several critical options passed to brm: formula, family and priors.  To fit the drift diffusion model, set family = wiener().  The formula is of the form rt | dec(choice) ~ stimulus.  That is, the RT conditioned on the response (dec(choice)) depends on the stimulus presented.
+
+```{r}
+# Fit the DDM using brms
+# Define the dependencies for each parameter.  The first line defines the drift rate, bs is the boundary separation, ndt is the nondecision time, and bias is the start point.
+formula <- bf(rt | dec(choice) ~ stimulus,  
+               bs ~ stimulus, 
+              ndt ~ 0 + stimulus, 
+              bias ~ 0 + stimulus)
+```
+
+Now define the priors on each paramter.
+```{r}
+# The drift rate has a cauchy prior, the boundary separation is normal, the nondecision time is normal and the bias is normal.
+prior <- c(
+ prior("cauchy(0, 5)", class = "b"),
+ set_prior("normal(1.5, 1)", class = "b", dpar = "bs"),
+ set_prior("normal(0.2, 0.1)", class = "b", dpar = "ndt"),
+ set_prior("normal(0.5, 0.2)", class = "b", dpar = "bias")
+)
+```
+
+The get_prior function lets you see the prior structure.
+```{r}
+  get_prior(formula,
+            data = data, 
+            family = wiener(link_bs = "identity", 
+                     link_ndt = "identity", 
+                     link_bias = "identity"))
+```
+
+Now we generate the stan code.
+```{r}
+make_stancode(formula, 
+              family = wiener(link_bs = "identity", 
+                              link_ndt = "identity",
+                              link_bias = "identity"),
+              data = data, 
+              prior = prior)
+```
+
+Set up the data.  "The "link" option is where the reparameterization happens.  "Identity" means no transformation, "log" means exponentiation (so make sure it's always positive), etc.  See the brms documentation for more options.
+
+```{r}
+tmp_dat <- make_standata(formula, 
+               family = wiener(link_bs = "identity", 
+                               link_ndt = "identity",
+                               link_bias = "identity"),
+                 data = data, prior = prior)
+str(tmp_dat, 1, give.attr = FALSE)
+```
+
+Finally, fit the model and generate estimates of the posterior distributions using brm().
+
+```{r}
+#ddm_model <- brm(
+#  # Specify the formula
+#  formula = formula,
+#  family = wiener(),  # Use the drift diffusion model family
+#  data = data,  # Provide the data
+#  prior = prior, # and the priors
+#  chains = 2,  # Number of Markov chains
+#  iter = 2000, # Number of iterations per chain
+#  warmup = 1000, # Warm-up (burnin)iterations
+#  cores = 2     # Use multiple cores for faster computation
+#)
+```
+
+Simulate the posterior predictive distribution.  It should look like the data.
+```{r}
+#NPRED=500
+#pred_wiener <- predict(ddm_model, 
+#                       summary = FALSE, 
+#                       negative_rt = TRUE, 
+#                       ndraws = NPRED)
+```
+
+```{r}
+# Summarize the model
+#summary(ddm_model)
+```
+
+```{r}
+# Plot posterior predictive checks
+# pp_check(ddm_model)
+```
+
+The predictive distribution should closely match the data but it does not, although it appears from the chains that the sampler has converged.  This could indicate a number of things, including the need to run longer chains, to use different starting values, or a misspecified model.
+
+
+## Your turn (if there's time)
+
+Modify the code above to fit the diffusion model to your own data.  Be warned: it can take a very long time to run.  
+```{r}
+# Insert your code here
+```
+
+# Approximate Bayesian Computation
+
+Finally, we should address models that do not have explicit likelihoods.  These include models like the leaky competing accumulator and diffusion models with nonstationary (time-dependent) drift rates and thresholds.  These models make predictions by way of simulation rather than by generating observations from a known likelihood function.
+
+There is a family of approaches that permit Bayesian analyses of these models called "approximate Bayesian computation" (ABC).  Here I present the simplest of these, *naive* ABC.
+
+The idea is very simple: rather than estimate the posterior as $\pi(\theta ~|~ Y)$, we instead look at $\pi(\theta ~|~ d(S(Y),S(Y')) | \le \epsilon)$, where $S(Y)$ is some statistic (or set of statistics) computed from the data $Y$, $Y'$ is a set of data simulated from the model, $d(x,y)$ is some distance measure, and $\epsilon > 0$ is some small value.
+
+```{r}
+set.seed(129879)
+# Naive ABC (Approximate Bayesian Computation)
+# Uses: 1. Reparameterization
+#       2. Filtering
+#       3. A "backward step" to keep from getting stuck
+
+# Try this with real data instead
+# take <- subset(wagenmakers,subject==3 & task==2 & long==1)$RT
+
+# Or use simulated exGaussian RTs.
+take <- rexgauss(1000,mu=300,tau=200,sigma=100)
+```
+
+ABC requires that we determine the statistics $S(Y)$ on which to base the posterior.  It would be nice if these statistics were "sufficient"; if they carried enough information about the parameters they are used to estimate as does the entire dataset $Y$.  Because we don't have a likelihood, we don't have any basis to determine sufficiency.  One thing we might do is use the empirical cdf.
+
+```{r}
+# Compute the summary statistics for the observed data
+ranks <- seq(.05,.95,by=.1)
+obs.q <- quantile(take,ranks)
+```
+
+We're going to start with a large value for $\epsilon$ and gradually reduce it, "filtering" the values in the chains.  The naive ABC algorithm takes the following steps:
+
+1. Initialize the sampling algorithm parameters and model parameters;
+2. Burn in until the filter has reached the desired endpoint; and
+3. Using the final state of the burned-in chain, sample the
+  desired number of values from the posterior.	
+
+
+Step 1: Initialize the algorithm and parameters.  To determine how small the final value of $\epsilon$ should be, let's take a look at what the values of $d(S(Y),S(X))$ will be when $X$ and $Y$ are identically distributed.  This is easy to do with simulated data $Y$ because we can just generate more samples $X$ from the same distribution.  If we are using real data, we could estimate these values by bootstrapping from $Y$.  We will choose the usual Euclidean distance for $d()$.
+
+```{r}
+#  What distribution of distances should we expect if the observed and simulated data are identically distributed?
+  d<-vector()
+  # Simulate X and Y 100 times and save the distances
+  for (i in 1:100) {
+  	sim1.q <- 
+  	  quantile(rexgauss(1000,mu=300,sigma=100,tau=200),ranks)
+  	sim2.q <- 
+  	  quantile(rexgauss(1000,mu=300,sigma=100,tau=200),ranks)
+  	d[i] <- sum((sim1.q-sim2.q)^2)
+  }
+ mean(d)
+ sd(d)
+```
+
+This suggests that the average value of $\epsilon$ should be around `r mean(d)`.  Too small and the posterior will be too narrow, too large and it will be too broad.  Let's set the final value equal to the mean plus two standard deviations.
+
+```{r}
+# Set threshold distance and desired endpoint 
+small <- 1000000 # Start with a really big threshold
+end <- mean(d) + 2*sd(d)       # Final threshold value
+
+# Set the number of samples and chain length
+N <- 1000      # Chain length 
+N.sim <- 1000  # Number of RTs to be simulated
+
+# Given N and the desired endpoint, compute the reduction factor for the filter epsilon (threshold distance)
+step <- exp(log(end/small)/N) 
+```
+
+We're ready to start sampling.  First initialize the chains.
+```{r}
+# Initialize the model parameters
+mu <- sigma <- tau <- d <- vector()
+# (Note that we are starting the chains around the true values -- again with the cheating!)
+mu[1] <- rnorm(1,300,10)
+sigma[1] <- exp(rnorm(1,log(100),1)) 
+tau[1] <- exp(rnorm(1,log(200),1))
+
+sim1.q <- quantile(rexgauss(N.sim,
+                            mu[1],sigma[1],tau[1]),
+                   ranks)
+d[1] <- sum((obs.q - sim1.q)^2)
+min.dist.loc <- 1 # What is this for?
+```
+
+
+
+We're going to run the sampler for a while until the chains get in the neighborhood of the posterior.  We'll start with a really big threshold for the distance and gradually reduce it (by step) and stop when the threshold is equal to the small final value (end).  (Sometimes this works and sometimes it fails spectacularly!  Allons-y!)
+
+```{r}
+# Use a while loop instead of a for loop so we can backtrack in case we get stuck
+i <- 1 # count the iterations
+# while(i <= N) {
+  while(small > end) {
+	i <- i + 1
+    print(c(i,d[i-1],small)) # So you'll know if it's stuck or only slow
+
+    k <- 0  # k will keep track of the number of attempts to find a good proposal
+    # While the distance between the simulated and observed data is large, keep trying new proposal values
+    repeat {
+       k <- k+1
+       # Generate new proposals around the old values
+       mu.star <- rnorm(1,mu[i-1],10)
+       sigma.star <- exp(rnorm(1,log(sigma[i-1]),.1))
+       tau.star <- exp(rnorm(1,log(tau[i-1]),1))
+
+       # Simulate data and compute quantiles (empirical cdf)
+       sim.q <- quantile(
+         rexgauss(N.sim,
+                  mu=mu.star,
+                  sigma=sigma.star,
+                  tau=tau.star),
+                  ranks,na.rm=TRUE)
+ 
+       # Compute distance between simulated and observed quantiles
+       dist <- sum((sim.q-obs.q)^2)
+       # If the chain keeps getting stuck, uncomment this line to follow its progress
+       # print(c(i,k,dist))
+       
+       # Exit the loop if the distance is small enough
+       if (dist < small) {break}
+       
+       # If the chain seems stuck (k>=1000), back up to the last known "good" set of parameter values
+       if (k>1000) {
+         # Caution: if things go really bad, this can take you all the way back to the first iteration:
+#           i <- i-1
+           k <- 0
+           # Go back to the best sampled values
+           mu[i-1] <- mu[min.dist.loc]
+           sigma[i-1] <- sigma[min.dist.loc]
+           tau[i-1] <- tau[min.dist.loc]
+           }
+      } # End of "repeat" loop
+    # Keep the proposals that produced acceptable data (also the distance)  
+    mu[i] <- mu.star
+    tau[i] <- tau.star
+    sigma[i] <- sigma.star
+    d[i] <- dist
+    if (dist <= d[min.dist.loc]) min.dist.loc <- i
+    # Reduce the threshold by a factor step
+    small <- step*small
+    } # Repeat until small <= end
+```
+
+Now you have reasonable ("converged") starting values and a threshold value.  Let's generate chains for each parameter. 
+
+```{r}
+# Sample using the last state in the chain
+# All steps are exactly the same as during burnin except the threshold is fixed   
+while (i <= 2*N) {
+	i <- i + 1
+    print(i)
+    k <- 0
+    # Find the next values in the chain
+    repeat {
+    k <- k+1
+    # Generate proposals
+    mu.star <- rnorm(1,mu[i-1],30)
+    sigma.star <- exp(rnorm(1,log(sigma[i-1]),.1))
+    tau.star <- exp(rnorm(1,log(tau[i-1]),1))
+    # Simulate data
+    sim.q <- quantile(rexgauss(N.sim,mu.star,sigma.star,tau.star),ranks)
+
+    # Compute distance between simulated and observed statistics
+    dist <- sum((sim.q-obs.q)^2)
+    # print(c(i,k,d))
+    # Keep proposals if the distance is small
+    if (dist < small) {break}
+    # Back up if stuck
+    if (k>1000) {
+        i <- i-1
+        k <- 0
+    }
+    }
+    # Add successful proposals to the chain
+    mu[i] <- mu.star
+    tau[i] <- tau.star
+    sigma[i] <- sigma.star
+    d[i] <- dist
+    }
+```    
+	
+How did we do?  Examine the chains.
+```{r}
+par(mfrow=c(3,1))
+plot(mu,xlab="")
+plot(sigma,xlab="")
+plot(tau,xlab="Iterations")
+```
+
+While $\mu$ and $\tau$ seem to have converged around the right values, $\sigma$ is a mess.  
+
+## Your turn!
+
+Play around with the ABC code - anything is fair game.  How could you improve the posterior for sigma?  (How can you improve the estimate of any posterior?)  If you have the time and inclination, run your own data through the ABC algorithm, and change the model.  Could you fit the drift diffusion model this way?
+
+```{r}
+# Insert your code here
+```
+
+
